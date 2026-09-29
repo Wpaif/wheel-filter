@@ -1,0 +1,11 @@
+[Unit]
+Description=wheel-filter: remove ticks fantasma da roda do mouse (Logitech G703)
+StartLimitIntervalSec=0
+
+[Service]
+ExecStart=/usr/local/bin/wheel-filter -d G703
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
