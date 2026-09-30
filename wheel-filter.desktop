@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Wheel Filter
+Comment=Filtra ticks fantasma da roda do mouse
+Exec=/usr/local/bin/wheel-filter --gui
+Icon=input-mouse
+Terminal=false
+Categories=Settings;HardwareSettings;
