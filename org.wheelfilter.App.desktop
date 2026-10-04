@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Wheel Filter
+GenericName=Filtro da roda do mouse
+GenericName[pt_BR]=Filtro da roda do mouse
+Comment=Remove os ticks fantasma (inversões espúrias) da roda do mouse
+Comment[pt_BR]=Remove os ticks fantasma (inversões espúrias) da roda do mouse
+Comment[en]=Removes ghost ticks (spurious reversals) from the mouse wheel
+Exec=@PREFIX@/bin/wheel-filter --gui
+Icon=wheel-filter
+Terminal=false
+StartupNotify=true
+StartupWMClass=org.wheelfilter.App
+Categories=Settings;HardwareSettings;GTK;
+Keywords=mouse;wheel;scroll;ghost;roda;rolagem;filtro;

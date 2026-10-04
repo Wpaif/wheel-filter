@@ -15,6 +15,11 @@
  *   são descartados (era ruído). Se nada chegar em -f ms (padrão 350), a
  *   inversão é considerada real. Depois de -i ms sem nenhum evento (padrão
  *   500), o próximo tick passa direto, em qualquer direção.
+ *
+ * Além disso o filtro aprende com o uso (ver filter.h): durante uma rolagem
+ * contínua exige mais confirmações para inverter, descobre o menor tempo
+ * humano de inversão, rotula retroativamente os ghosts que passaram e guarda
+ * tudo em disco entre sessões.
  */
 
 #define _GNU_SOURCE
@@ -151,8 +156,8 @@ static void cli_state(void *user, const char *state, const char *msg)
 static void engine_tick(void *user, const tick_t *t, int pass)
 {
     (void)user;
-    printf("TICK\t%.6f\t%d\t%s\t%.2f\n", t->ts, t->value,
-           pass ? "PASS" : "GHOST", t->gap_ms);
+    printf("TICK\t%.6f\t%d\t%s\t%.2f\t%d\t%d\n", t->ts, t->value,
+           pass ? "PASS" : "GHOST", t->gap_ms, t->sector, t->period);
     fflush(stdout);
 }
 
@@ -178,6 +183,8 @@ static void usage(const char *prog)
         "  -f ms    tempo para considerar uma inversão isolada como real (350)\n"
         "  -i ms    inatividade após a qual o próximo tick sempre passa (500)\n"
         "  -d nome  acha o mouse pelo nome (ex.: -d G703); espera se ele sumir\n"
+        "  -s dir   onde guardar o que o filtro aprendeu (padrão: /var/lib/wheel-filter\n"
+        "           como root; ~/.local/state/wheel-filter caso contrário)\n"
         "  -n       só observar (ao vivo): não captura o mouse nem filtra\n"
         "  -l arq   registra os ticks descartados em arq (ao vivo)\n",
         prog, prog, prog, prog);
@@ -195,6 +202,7 @@ int main(int argc, char *argv[])
     int gui = 0;
     const char *logpath = NULL;
     const char *devname = NULL;
+    const char *statedir = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-c") && i + 1 < argc) {
@@ -207,6 +215,8 @@ int main(int argc, char *argv[])
             devname = argv[++i];
         } else if (!strcmp(argv[i], "-l") && i + 1 < argc) {
             logpath = argv[++i];
+        } else if (!strcmp(argv[i], "-s") && i + 1 < argc) {
+            statedir = argv[++i];
         } else if (!strcmp(argv[i], "-n")) {
             observe = 1;
         } else if (!strcmp(argv[i], "--engine")) {
@@ -251,6 +261,7 @@ int main(int argc, char *argv[])
     cfg.flush_ms = flush_ms;
     cfg.idle_ms = idle_ms;
     cfg.observe = observe;
+    cfg.state_dir = statedir;
     cfg.ctl_fd = -1;
 
     if (engine) {

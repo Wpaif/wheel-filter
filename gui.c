@@ -7,17 +7,39 @@
  * janela fechar ou travar, o stdin do motor fecha e ele solta o mouse sozinho.
  */
 
+#include <adwaita.h>
 #include <gtk/gtk.h>
 #include <gio/gio.h>
 #include <glib/gstdio.h>
 
+#include <math.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
 #include "devices.h"
+#include "filter.h"
 #include "gui.h"
+#include "tray.h"
+
+static const char *APP_CSS =
+    "label.success { color: @success_color; }\n"
+    "label.warning { color: @warning_color; }\n"
+    "label.error { color: @error_color; }\n"
+    ".dim-label { opacity: 0.55; }\n"
+    ".stat-tile { padding: 12px 14px; border-radius: 14px; }\n"
+    ".stat-value { font-size: 26px; font-weight: 800;\n"
+    "              font-feature-settings: 'tnum'; transition: color 450ms ease; }\n"
+    ".stat-value.flash { color: @error_color; transition: color 60ms ease; }\n"
+    ".ring-pct { font-size: 28px; font-weight: 800; }\n"
+    ".status-pill { padding: 3px 12px; border-radius: 999px;\n"
+    "               background: alpha(currentColor, 0.08); }\n"
+    ".banner { padding: 8px 12px; border-radius: 12px;\n"
+    "          background: alpha(@warning_color, 0.15); }\n"
+    ".log-card { border-radius: 14px; padding: 2px; }\n"
+    ".log-card textview, .log-card text { background: transparent; }\n"
+    "button.start-btn { padding: 6px 18px; min-height: 0; }\n";
 
 #define APP_ID "org.wheelfilter.App"
 #define LOG_MAX (4 * 1024 * 1024)
@@ -54,8 +76,11 @@ typedef struct {
     GtkWidget *service_warn;
 
     /* monitor */
-    GtkWidget *lbl_stats1;
-    GtkWidget *lbl_stats2;
+    GtkWidget *tile[5];             /* recebidos, liberados, filtrados, taxa, tempo */
+    GtkWidget *ring_lbl;
+    double pulse;                   /* 1 -> 0 depois de cada tick */
+    gint64 pulse_t;
+    guint flash_id;
     GtkWidget *monitor;
     GtkTextBuffer *buf;
     GtkTextMark *end_mark;
@@ -79,10 +104,21 @@ typedef struct {
     /* config em disco */
     GKeyFile *cfg;
     char *cfg_path;
+
+    tray_t *tray;
+    GtkWidget *tray_warn;
+    GtkWidget *sec_draw;
+    GtkWidget *sec_label;
+    int sec_period;
+    int sec_current;
+    unsigned long sec_hits[MAX_SECTORS];
+    unsigned long sec_ghosts[MAX_SECTORS];
+    GPtrArray *dev_radios;
 } App;
 
 static void select_device(App *a, int idx);
 static void update_buttons(App *a);
+static void tray_sync(App *a);
 
 /* ------------------------------------------------------------------ */
 /* utilidades                                                          */
@@ -193,7 +229,7 @@ static void profile_apply(App *a, const mouse_info_t *m)
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(a->sp_confirm), c);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(a->sp_flush), f);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(a->sp_idle), i);
-    gtk_check_button_set_active(GTK_CHECK_BUTTON(a->chk_observe), obs);
+    gtk_switch_set_active(GTK_SWITCH(a->chk_observe), obs);
     a->loading = FALSE;
 }
 
@@ -213,7 +249,7 @@ static void profile_store(App *a)
     g_key_file_set_integer(a->cfg, g, "idle_ms",
                            gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(a->sp_idle)));
     g_key_file_set_boolean(a->cfg, g, "observe",
-                           gtk_check_button_get_active(GTK_CHECK_BUTTON(a->chk_observe)));
+                           gtk_switch_get_active(GTK_SWITCH(a->chk_observe)));
     g_free(g);
     cfg_save(a);
 }
@@ -233,15 +269,45 @@ static void update_stats(App *a)
     long s = (long)(a->last_secs % 60);
     double pct = a->rx ? 100.0 * (double)a->ghosts / (double)a->rx : 0.0;
 
-    char *t1 = g_strdup_printf("Ticks recebidos: %ld     Liberados: %ld     Filtrados: %ld",
-                               a->rx, a->pass, a->ghosts);
-    char *t2 = g_strdup_printf("Possíveis ghosts: %ld (%.1f%%)     Tempo ativo: %02ld:%02ld:%02ld",
-                               a->ghosts, pct, h, m, s);
+    char *v[5] = {
+        g_strdup_printf("%ld", a->rx),
+        g_strdup_printf("%ld", a->pass),
+        g_strdup_printf("%ld", a->ghosts),
+        g_strdup_printf("%.1f%%", pct),
+        g_strdup_printf("%02ld:%02ld:%02ld", h, m, s),
+    };
 
-    gtk_label_set_text(GTK_LABEL(a->lbl_stats1), t1);
-    gtk_label_set_text(GTK_LABEL(a->lbl_stats2), t2);
-    g_free(t1);
-    g_free(t2);
+    for (int i = 0; i < 5; i++) {
+        gtk_label_set_text(GTK_LABEL(a->tile[i]), v[i]);
+    }
+    if (a->ring_lbl) {
+        gtk_label_set_text(GTK_LABEL(a->ring_lbl), v[3]);
+    }
+    for (int i = 0; i < 5; i++) {
+        g_free(v[i]);
+    }
+
+    if (a->sec_label) {
+        int hot = 0;
+        int p = a->sec_period > 0 ? a->sec_period : DEFAULT_PERIOD;
+
+        for (int i = 0; i < p && i < MAX_SECTORS; i++) {
+            if (a->sec_hits[i] >= 8 &&
+                (double)a->sec_ghosts[i] / (double)a->sec_hits[i] >= 0.12) {
+                hot++;
+            }
+        }
+
+        char *s = g_strdup_printf(
+            "%d detentes · setor atual %d\n%d %s",
+            p, a->sec_current, hot, hot == 1 ? "setor instável" : "setores instáveis");
+        gtk_label_set_text(GTK_LABEL(a->sec_label), s);
+        g_free(s);
+    }
+
+    if (a->sec_draw) {
+        gtk_widget_queue_draw(a->sec_draw);
+    }
 }
 
 static void monitor_append(App *a, const char *text)
@@ -276,6 +342,26 @@ static void log_append(App *a, const char *text)
     }
 }
 
+static gboolean unflash_cb(gpointer data)
+{
+    App *a = data;
+
+    a->flash_id = 0;
+    gtk_widget_remove_css_class(a->tile[2], "flash");
+    gtk_widget_remove_css_class(a->tile[3], "flash");
+    return G_SOURCE_REMOVE;
+}
+
+static void flash_ghost(App *a)
+{
+    gtk_widget_add_css_class(a->tile[2], "flash");
+    gtk_widget_add_css_class(a->tile[3], "flash");
+    if (a->flash_id) {
+        g_source_remove(a->flash_id);
+    }
+    a->flash_id = g_timeout_add(350, unflash_cb, a);
+}
+
 static void on_tick(App *a, char **f)
 {
     double ts = g_ascii_strtod(f[1], NULL);
@@ -287,10 +373,29 @@ static void on_tick(App *a, char **f)
     fmt_clock(ts, when, sizeof(when));
 
     a->rx++;
+    a->pulse = 1.0;
+    a->pulse_t = g_get_monotonic_time();
     if (ghost) {
         a->ghosts++;
+        flash_ghost(a);
     } else {
         a->pass++;
+    }
+
+    if (g_strv_length(f) >= 7) {
+        int sector = atoi(f[5]);
+        int period = atoi(f[6]);
+
+        if (period > 0 && period <= MAX_SECTORS) {
+            a->sec_period = period;
+        }
+        if (sector >= 0 && sector < MAX_SECTORS) {
+            a->sec_current = sector;
+            a->sec_hits[sector]++;
+            if (ghost) {
+                a->sec_ghosts[sector]++;
+            }
+        }
     }
 
     char *gap_txt = gap < 0 ? g_strdup("---") : g_strdup_printf("%.2f", gap);
@@ -339,6 +444,7 @@ static void on_state(App *a, const char *state, const char *msg)
     log_append(a, log_line);
     g_free(log_line);
     g_free(text);
+    tray_set_status(a->tray, gtk_label_get_text(GTK_LABEL(a->status)));
 }
 
 static void handle_line(App *a, const char *line)
@@ -446,14 +552,18 @@ static void finish_session(App *a, int status)
 
     if (a->last_error) {
         set_status(a, a->last_error, "error");
+        tray_set_status(a->tray, a->last_error);
     } else if (status == 126 || status == 127) {
         set_status(a, "✖ Autenticação cancelada ou negada.", "error");
+        tray_set_status(a->tray, "Autenticação cancelada");
     } else if (status != 0) {
         char *t = g_strdup_printf("✖ O filtro terminou com erro (código %d).", status);
         set_status(a, t, "error");
+        tray_set_status(a->tray, t);
         g_free(t);
     } else {
         set_status(a, "● Filtro parado — o mouse voltou ao normal", NULL);
+        tray_set_status(a->tray, "Filtro parado");
     }
 
     log_append(a, "# sessão encerrada\n");
@@ -490,7 +600,7 @@ static void do_start(App *a)
         return;
     }
 
-    gboolean observe = gtk_check_button_get_active(GTK_CHECK_BUTTON(a->chk_observe));
+    gboolean observe = gtk_switch_get_active(GTK_SWITCH(a->chk_observe));
 
     GPtrArray *argv = g_ptr_array_new_with_free_func(g_free);
     g_ptr_array_add(argv, g_strdup("pkexec"));
@@ -537,6 +647,10 @@ static void do_start(App *a)
     a->rx = a->pass = a->ghosts = 0;
     a->t0 = g_get_monotonic_time();
     a->last_secs = 0;
+    a->sec_period = DEFAULT_PERIOD;
+    a->sec_current = 0;
+    memset(a->sec_hits, 0, sizeof(a->sec_hits));
+    memset(a->sec_ghosts, 0, sizeof(a->sec_ghosts));
 
     char *hdr = g_strdup_printf("# %s — %s (%s)  -c %d -f %d -i %d%s\n", m->name,
         m->stable_path, m->stable_kind,
@@ -603,7 +717,7 @@ static void on_start_clicked(GtkButton *b, gpointer data)
         return;
     }
 
-    if (gtk_check_button_get_active(GTK_CHECK_BUTTON(a->chk_observe))) {
+    if (gtk_switch_get_active(GTK_SWITCH(a->chk_observe))) {
         do_start(a);            /* observação não captura nada */
         return;
     }
@@ -631,6 +745,80 @@ static void on_start_clicked(GtkButton *b, gpointer data)
 #endif
 }
 
+static void tray_sync(App *a)
+{
+    if (!a->tray || !a->sp_confirm) {
+        return;
+    }
+
+    tray_update(
+        a->tray, a->devs, a->selected,
+        gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(a->sp_confirm)),
+        gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(a->sp_flush)),
+        gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(a->sp_idle)),
+        a->running, selected_mouse(a) != NULL);
+}
+
+static void tray_on_show(void *user)
+{
+    App *a = user;
+    gtk_window_present(GTK_WINDOW(a->win));
+}
+
+static void tray_on_quit(void *user)
+{
+    App *a = user;
+
+    if (a->running) {
+        send_line(a, "STOP\n");
+    }
+    if (a->proc) {
+        g_subprocess_send_signal(a->proc, SIGTERM);
+    }
+    g_application_quit(G_APPLICATION(a->gapp));
+}
+
+static void tray_on_device(void *user, int idx)
+{
+    App *a = user;
+
+    if (a->running) {
+        return;
+    }
+    if (a->dev_radios && idx >= 0 && idx < (int)a->dev_radios->len) {
+        gtk_check_button_set_active(
+            GTK_CHECK_BUTTON(g_ptr_array_index(a->dev_radios, idx)), TRUE);
+        return;
+    }
+    select_device(a, idx);
+}
+
+static void tray_on_confirm(void *user, int v)
+{
+    App *a = user;
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(a->sp_confirm), v);
+}
+
+static void tray_on_flush(void *user, int v)
+{
+    App *a = user;
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(a->sp_flush), v);
+}
+
+static void tray_on_idle(void *user, int v)
+{
+    App *a = user;
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(a->sp_idle), v);
+}
+
+static void tray_on_toggle(void *user)
+{
+    App *a = user;
+
+    gtk_window_present(GTK_WINDOW(a->win));
+    on_start_clicked(NULL, a);
+}
+
 /* ------------------------------------------------------------------ */
 /* dispositivos                                                        */
 /* ------------------------------------------------------------------ */
@@ -641,16 +829,24 @@ static void update_buttons(App *a)
 
     if (a->running) {
         label = "Parar filtro";
-    } else if (gtk_check_button_get_active(GTK_CHECK_BUTTON(a->chk_observe))) {
+    } else if (gtk_switch_get_active(GTK_SWITCH(a->chk_observe))) {
         label = "Iniciar observação";
     } else {
         label = "Iniciar filtro";
     }
 
     gtk_button_set_label(GTK_BUTTON(a->btn_start), label);
+    if (a->running) {
+        gtk_widget_remove_css_class(a->btn_start, "suggested-action");
+        gtk_widget_add_css_class(a->btn_start, "destructive-action");
+    } else {
+        gtk_widget_remove_css_class(a->btn_start, "destructive-action");
+        gtk_widget_add_css_class(a->btn_start, "suggested-action");
+    }
     gtk_widget_set_sensitive(a->btn_start, a->running || selected_mouse(a) != NULL);
     gtk_widget_set_sensitive(a->chk_observe, !a->running);
     gtk_widget_set_sensitive(a->dev_box, !a->running);
+    tray_sync(a);
 }
 
 static void select_device(App *a, int idx)
@@ -737,15 +933,9 @@ static void rebuild_devices(App *a, gboolean force)
         gtk_box_remove(GTK_BOX(a->dev_box), a->dev_grid);
     }
 
-    GtkWidget *grid = gtk_grid_new();
-    gtk_grid_set_column_spacing(GTK_GRID(grid), 16);
-    gtk_grid_set_row_spacing(GTK_GRID(grid), 6);
-
-    gtk_grid_attach(GTK_GRID(grid), make_label("", NULL), 0, 0, 1, 1);
-    gtk_grid_attach(GTK_GRID(grid), make_label("Dispositivo", "heading"), 1, 0, 1, 1);
-    gtk_grid_attach(GTK_GRID(grid), make_label("Nome", "heading"), 2, 0, 1, 1);
-    gtk_grid_attach(GTK_GRID(grid), make_label("Roda", "heading"), 3, 0, 1, 1);
-    gtk_grid_attach(GTK_GRID(grid), make_label("Status", "heading"), 4, 0, 1, 1);
+    GtkWidget *grid = gtk_list_box_new();
+    gtk_list_box_set_selection_mode(GTK_LIST_BOX(grid), GTK_SELECTION_NONE);
+    gtk_widget_add_css_class(grid, "boxed-list");
 
     GPtrArray *radios = g_ptr_array_new();
     GtkWidget *first = NULL;
@@ -763,18 +953,20 @@ static void rebuild_devices(App *a, gboolean force)
             first = radio;
         }
 
-        gtk_widget_set_sensitive(radio, m->has_wheel);
+        gtk_widget_set_valign(radio, GTK_ALIGN_CENTER);
         g_object_set_data(G_OBJECT(radio), "idx", GINT_TO_POINTER((int)i));
         g_ptr_array_add(radios, radio);
 
-        gtk_grid_attach(GTK_GRID(grid), radio, 0, (int)i + 1, 1, 1);
-        gtk_grid_attach(GTK_GRID(grid), make_label(m->event_path, NULL), 1, (int)i + 1, 1, 1);
-        gtk_grid_attach(GTK_GRID(grid), make_label(m->name, NULL), 2, (int)i + 1, 1, 1);
-        gtk_grid_attach(GTK_GRID(grid),
-                        make_label(m->has_wheel ? "Sim" : "Não", NULL), 3, (int)i + 1, 1, 1);
-        gtk_grid_attach(GTK_GRID(grid),
-                        make_label(m->has_wheel ? "Disponível" : "Sem roda", NULL),
-                        4, (int)i + 1, 1, 1);
+        GtkWidget *row = adw_action_row_new();
+        char *sub = g_strdup_printf("%s%s", m->event_path,
+                                    m->has_wheel ? "" : " · sem roda");
+        adw_preferences_row_set_title(ADW_PREFERENCES_ROW(row), m->name);
+        adw_action_row_set_subtitle(ADW_ACTION_ROW(row), sub);
+        g_free(sub);
+        adw_action_row_add_prefix(ADW_ACTION_ROW(row), radio);
+        adw_action_row_set_activatable_widget(ADW_ACTION_ROW(row), radio);
+        gtk_widget_set_sensitive(row, m->has_wheel);
+        gtk_list_box_append(GTK_LIST_BOX(grid), row);
 
         if (a->selected_stable && strcmp(m->stable_path, a->selected_stable) == 0) {
             want = (int)i;
@@ -790,9 +982,11 @@ static void rebuild_devices(App *a, gboolean force)
     }
 
     if (a->devs->len == 0) {
-        gtk_grid_attach(GTK_GRID(grid),
-                        make_label("Nenhum mouse encontrado.", "dim-label"),
-                        1, 1, 4, 1);
+        GtkWidget *row = adw_action_row_new();
+        adw_preferences_row_set_title(ADW_PREFERENCES_ROW(row),
+                                      "Nenhum mouse encontrado");
+        gtk_widget_set_sensitive(row, FALSE);
+        gtk_list_box_append(GTK_LIST_BOX(grid), row);
     }
 
     a->dev_grid = grid;
@@ -802,6 +996,11 @@ static void rebuild_devices(App *a, gboolean force)
         g_signal_connect(g_ptr_array_index(radios, i), "toggled",
                          G_CALLBACK(on_radio_toggled), a);
     }
+
+    if (a->dev_radios) {
+        g_ptr_array_unref(a->dev_radios);
+    }
+    a->dev_radios = radios;
 
     if (want < 0 && !a->selected_stable) {
         want = by_last;         /* restaura a escolha explícita anterior */
@@ -813,8 +1012,6 @@ static void rebuild_devices(App *a, gboolean force)
     } else {
         select_device(a, -1);
     }
-
-    g_ptr_array_unref(radios);
 }
 
 static void on_refresh_clicked(GtkButton *b, gpointer data)
@@ -933,23 +1130,78 @@ static gboolean on_close_request(GtkWindow *w, gpointer data)
     App *a = data;
     (void)w;
 
-    if (a->running) {
-        send_line(a, "STOP\n");
-    }
-
-    return FALSE;
+    gtk_widget_set_visible(GTK_WIDGET(a->win), FALSE);
+    return TRUE;
 }
 
-static GtkWidget *make_frame(const char *title, GtkWidget *child)
+static void draw_sectors(GtkDrawingArea *area, cairo_t *cr, int width,
+                         int height, gpointer data)
 {
-    GtkWidget *frame = gtk_frame_new(title);
+    App *a = data;
+    int p = a->sec_period > 0 ? a->sec_period : DEFAULT_PERIOD;
+    double cx = width / 2.0;
+    double cy = height / 2.0;
+    double r = (width < height ? width : height) / 2.0 - 4.0;
+    double ri = r * 0.70;
+    double gap = 0.035;
+    GdkRGBA fg, ac;
+    gboolean dark =
+        adw_style_manager_get_dark(adw_style_manager_get_default());
 
-    gtk_widget_set_margin_top(child, 8);
-    gtk_widget_set_margin_bottom(child, 8);
-    gtk_widget_set_margin_start(child, 10);
-    gtk_widget_set_margin_end(child, 10);
-    gtk_frame_set_child(GTK_FRAME(frame), child);
-    return frame;
+    gtk_widget_get_color(GTK_WIDGET(area), &fg);
+    GdkRGBA *acp =
+        adw_style_manager_get_accent_color_rgba(adw_style_manager_get_default());
+    ac = *acp;
+    gdk_rgba_free(acp);
+
+    for (int i = 0; i < p; i++) {
+        double a0 = -G_PI / 2.0 + (2.0 * G_PI * i) / p + gap / 2;
+        double a1 = -G_PI / 2.0 + (2.0 * G_PI * (i + 1)) / p - gap / 2;
+        double rate = 0.0;
+        gboolean cur = i == a->sec_current;
+
+        if (i < MAX_SECTORS && a->sec_hits[i] > 0) {
+            rate = (double)a->sec_ghosts[i] / (double)a->sec_hits[i];
+        }
+        rate = rate > 0.4 ? 1.0 : rate / 0.4;       /* 40% já é "quente" */
+
+        double hot = dark ? 0.95 : 0.80;
+        double base = 0.10 + 0.80 * rate;
+
+        if (rate > 0.0) {
+            cairo_set_source_rgba(cr, hot, 0.38 * (1.0 - rate) + 0.18, 0.25,
+                                  base);
+        } else if (a->sec_hits[i < MAX_SECTORS ? i : 0] > 0) {
+            cairo_set_source_rgba(cr, fg.red, fg.green, fg.blue, 0.22);
+        } else {
+            cairo_set_source_rgba(cr, fg.red, fg.green, fg.blue, 0.10);
+        }
+        if (cur) {
+            cairo_set_source_rgba(cr, ac.red, ac.green, ac.blue,
+                                  0.55 + 0.45 * a->pulse);
+        }
+
+        double rr = cur ? r + 3.0 * a->pulse : r;
+        cairo_new_path(cr);
+        cairo_arc(cr, cx, cy, rr, a0, a1);
+        cairo_arc_negative(cr, cx, cy, ri, a1, a0);
+        cairo_close_path(cr);
+        cairo_fill(cr);
+    }
+}
+
+static gboolean pulse_tick(GtkWidget *w, GdkFrameClock *clock, gpointer data)
+{
+    App *a = data;
+    (void)clock;
+
+    if (a->pulse > 0.0) {
+        double dt = (g_get_monotonic_time() - a->pulse_t) / 1e6;
+
+        a->pulse = dt >= 0.6 ? 0.0 : 1.0 - dt / 0.6;
+        gtk_widget_queue_draw(w);
+    }
+    return G_SOURCE_CONTINUE;
 }
 
 static GtkWidget *make_spin(App *a, double min, double max, double step, double val)
@@ -957,126 +1209,246 @@ static GtkWidget *make_spin(App *a, double min, double max, double step, double 
     GtkWidget *sp = gtk_spin_button_new_with_range(min, max, step);
 
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(sp), val);
+    gtk_widget_set_valign(sp, GTK_ALIGN_CENTER);
     g_signal_connect(sp, "value-changed", G_CALLBACK(on_params_changed), a);
     return sp;
 }
 
-static GtkWidget *make_desc(const char *text)
+static void on_observe_notify(GObject *o, GParamSpec *p, gpointer data)
 {
-    GtkWidget *l = make_label(text, "dim-label");
+    (void)p;
+    on_params_changed(GTK_WIDGET(o), data);
+}
 
-    gtk_label_set_wrap(GTK_LABEL(l), TRUE);
-    gtk_widget_set_hexpand(l, TRUE);
-    return l;
+static GtkWidget *param_row(const char *title, const char *sub,
+                            const char *tip, GtkWidget *spin)
+{
+    GtkWidget *row = adw_action_row_new();
+
+    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(row), title);
+    adw_action_row_set_subtitle(ADW_ACTION_ROW(row), sub);
+    adw_action_row_add_suffix(ADW_ACTION_ROW(row), spin);
+    gtk_widget_set_tooltip_text(row, tip);
+    return row;
+}
+
+static GtkWidget *make_tile(App *a, int idx, const char *caption)
+{
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+
+    gtk_widget_add_css_class(box, "card");
+    gtk_widget_add_css_class(box, "stat-tile");
+    gtk_widget_set_hexpand(box, TRUE);
+
+    a->tile[idx] = make_label("0", "stat-value");
+    GtkWidget *cap = make_label(caption, "dim-label");
+    gtk_widget_add_css_class(cap, "caption");
+
+    gtk_box_append(GTK_BOX(box), a->tile[idx]);
+    gtk_box_append(GTK_BOX(box), cap);
+    return box;
 }
 
 static void build_ui(App *a)
 {
-    a->win = gtk_application_window_new(a->gapp);
+    GtkCssProvider *css = gtk_css_provider_new();
+    gtk_css_provider_load_from_string(css, APP_CSS);
+    gtk_style_context_add_provider_for_display(
+        gdk_display_get_default(), GTK_STYLE_PROVIDER(css),
+        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    g_object_unref(css);
+
+    a->win = GTK_WIDGET(adw_application_window_new(a->gapp));
     gtk_window_set_title(GTK_WINDOW(a->win), "Wheel Filter");
-    gtk_window_set_default_size(GTK_WINDOW(a->win), 760, 820);
+    gtk_window_set_default_size(GTK_WINDOW(a->win), 940, 600);
     g_signal_connect(a->win, "close-request", G_CALLBACK(on_close_request), a);
 
-    GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
-    gtk_widget_set_margin_top(root, 12);
-    gtk_widget_set_margin_bottom(root, 12);
-    gtk_widget_set_margin_start(root, 12);
-    gtk_widget_set_margin_end(root, 12);
-    gtk_window_set_child(GTK_WINDOW(a->win), root);
+    /* --- barra superior: atualizar, estado, iniciar/parar --- */
+    GtkWidget *header = adw_header_bar_new();
 
-    GtkWidget *title = make_label("Wheel Filter", "title-2");
-    gtk_box_append(GTK_BOX(root), title);
+    GtkWidget *btn_refresh = gtk_button_new_from_icon_name("view-refresh-symbolic");
+    gtk_widget_set_tooltip_text(btn_refresh, "Atualizar dispositivos");
+    g_signal_connect(btn_refresh, "clicked", G_CALLBACK(on_refresh_clicked), a);
+    adw_header_bar_pack_start(ADW_HEADER_BAR(header), btn_refresh);
+
+    a->status = make_label("● Filtro parado", "status-pill");
+    gtk_label_set_ellipsize(GTK_LABEL(a->status), PANGO_ELLIPSIZE_END);
+    gtk_label_set_max_width_chars(GTK_LABEL(a->status), 48);
+    adw_header_bar_set_title_widget(ADW_HEADER_BAR(header), a->status);
+
+    a->btn_start = gtk_button_new_with_label("Iniciar filtro");
+    gtk_widget_add_css_class(a->btn_start, "suggested-action");
+    gtk_widget_add_css_class(a->btn_start, "pill");
+    gtk_widget_add_css_class(a->btn_start, "start-btn");
+    gtk_widget_set_sensitive(a->btn_start, FALSE);
+    g_signal_connect(a->btn_start, "clicked", G_CALLBACK(on_start_clicked), a);
+    adw_header_bar_pack_end(ADW_HEADER_BAR(header), a->btn_start);
+
+    GtkWidget *toolbar = adw_toolbar_view_new();
+    adw_toolbar_view_add_top_bar(ADW_TOOLBAR_VIEW(toolbar), header);
+    adw_application_window_set_content(ADW_APPLICATION_WINDOW(a->win), toolbar);
+
+    GtkWidget *root = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 18);
+    gtk_widget_set_margin_top(root, 6);
+    gtk_widget_set_margin_bottom(root, 18);
+    gtk_widget_set_margin_start(root, 18);
+    gtk_widget_set_margin_end(root, 18);
+    adw_toolbar_view_set_content(ADW_TOOLBAR_VIEW(toolbar), root);
+
+    /* ============ coluna esquerda: mouse + filtro ============ */
+    GtkWidget *left = gtk_box_new(GTK_ORIENTATION_VERTICAL, 14);
+    gtk_widget_set_size_request(left, 330, -1);
+
+    a->tray_warn = make_label(
+        "O ícone da bandeja precisa da extensão AppIndicator "
+        "(KStatusNotifierItem) no GNOME. Sem ela o programa continua em "
+        "segundo plano ao fechar a janela; reabra pelo Dash ou pela busca.",
+        "dim-label");
+    gtk_widget_add_css_class(a->tray_warn, "banner");
+    gtk_label_set_wrap(GTK_LABEL(a->tray_warn), TRUE);
+    gtk_widget_set_visible(a->tray_warn, FALSE);
+    gtk_box_append(GTK_BOX(left), a->tray_warn);
 
     a->service_warn = make_label(
         "⚠ O serviço «wheel-filter» está ativo e já captura o mouse. "
         "Pare-o antes (sudo systemctl stop wheel-filter), senão o filtro "
         "daqui não conseguirá iniciar.", "warning");
+    gtk_widget_add_css_class(a->service_warn, "banner");
     gtk_label_set_wrap(GTK_LABEL(a->service_warn), TRUE);
     gtk_widget_set_visible(a->service_warn, FALSE);
-    gtk_box_append(GTK_BOX(root), a->service_warn);
+    gtk_box_append(GTK_BOX(left), a->service_warn);
 
-    /* --- mouse --- */
-    GtkWidget *mouse_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
-
+    GtkWidget *g_mouse = adw_preferences_group_new();
+    adw_preferences_group_set_title(ADW_PREFERENCES_GROUP(g_mouse), "Mouse");
     a->dev_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-    gtk_box_append(GTK_BOX(mouse_box), a->dev_box);
+    adw_preferences_group_add(ADW_PREFERENCES_GROUP(g_mouse), a->dev_box);
 
-    GtkWidget *btn_refresh = gtk_button_new_with_label("Atualizar dispositivos");
-    gtk_widget_set_halign(btn_refresh, GTK_ALIGN_START);
-    g_signal_connect(btn_refresh, "clicked", G_CALLBACK(on_refresh_clicked), a);
-    gtk_box_append(GTK_BOX(mouse_box), btn_refresh);
+    /* rótulos de seleção: mantidos para o estado interno, sem ocupar espaço */
+    a->sel_name = make_label("", NULL);
+    a->sel_path = make_label("", NULL);
+    a->sel_wheel = make_label("", NULL);
+    gtk_widget_set_visible(a->sel_name, FALSE);
+    gtk_widget_set_visible(a->sel_path, FALSE);
+    gtk_widget_set_visible(a->sel_wheel, FALSE);
+    gtk_box_append(GTK_BOX(a->dev_box), a->sel_name);
+    gtk_box_append(GTK_BOX(a->dev_box), a->sel_path);
+    gtk_box_append(GTK_BOX(a->dev_box), a->sel_wheel);
+    gtk_box_append(GTK_BOX(left), g_mouse);
 
-    a->sel_name = make_label("Nenhum mouse selecionado", "title-4");
-    a->sel_path = make_label("", "dim-label");
-    a->sel_wheel = make_label("", "dim-label");
-    gtk_box_append(GTK_BOX(mouse_box), a->sel_name);
-    gtk_box_append(GTK_BOX(mouse_box), a->sel_path);
-    gtk_box_append(GTK_BOX(mouse_box), a->sel_wheel);
-
-    gtk_box_append(GTK_BOX(root), make_frame("Mouse", mouse_box));
-
-    /* --- configuração --- */
-    GtkWidget *cfg = gtk_grid_new();
-    gtk_grid_set_column_spacing(GTK_GRID(cfg), 12);
-    gtk_grid_set_row_spacing(GTK_GRID(cfg), 8);
+    GtkWidget *g_cfg = adw_preferences_group_new();
+    adw_preferences_group_set_title(ADW_PREFERENCES_GROUP(g_cfg), "Filtro");
 
     a->sp_confirm = make_spin(a, 1, 8, 1, 2);
     a->sp_flush = make_spin(a, 50, 2000, 10, 350);
     a->sp_idle = make_spin(a, 100, 5000, 50, 500);
 
-    gtk_grid_attach(GTK_GRID(cfg), make_label("Ticks para confirmar inversão:", NULL), 0, 0, 1, 1);
-    gtk_grid_attach(GTK_GRID(cfg), a->sp_confirm, 1, 0, 1, 1);
-    gtk_grid_attach(GTK_GRID(cfg), make_desc(
+    adw_preferences_group_add(ADW_PREFERENCES_GROUP(g_cfg), param_row(
+        "Ticks para confirmar", "Seguidos na nova direção para inverter",
         "Quantos ticks seguidos na nova direção são necessários para aceitar uma "
-        "inversão. Mais alto filtra mais, mas atrasa inversões reais."), 2, 0, 1, 1);
+        "inversão. Mais alto filtra mais, mas atrasa inversões reais.",
+        a->sp_confirm));
+    adw_preferences_group_add(ADW_PREFERENCES_GROUP(g_cfg), param_row(
+        "Tempo de confirmação", "ms até liberar uma inversão isolada",
+        "Uma inversão isolada que não for seguida de nada nesse tempo é "
+        "considerada real e liberada — salvo em um detente que o filtro já "
+        "marcou como instável.",
+        a->sp_flush));
+    adw_preferences_group_add(ADW_PREFERENCES_GROUP(g_cfg), param_row(
+        "Inatividade", "ms sem eventos até passar direto",
+        "Depois desse tempo sem eventos, o próximo tick passa direto em "
+        "qualquer direção. Não use um valor menor que o tempo de confirmação.",
+        a->sp_idle));
 
-    gtk_grid_attach(GTK_GRID(cfg), make_label("Tempo de confirmação (ms):", NULL), 0, 1, 1, 1);
-    gtk_grid_attach(GTK_GRID(cfg), a->sp_flush, 1, 1, 1, 1);
-    gtk_grid_attach(GTK_GRID(cfg), make_desc(
-        "Uma inversão isolada que não for seguida de nada nesse tempo é considerada "
-        "real e liberada."), 2, 1, 1, 1);
+    a->chk_observe = gtk_switch_new();
+    gtk_widget_set_valign(a->chk_observe, GTK_ALIGN_CENTER);
+    g_signal_connect(a->chk_observe, "notify::active",
+                     G_CALLBACK(on_observe_notify), a);
+    GtkWidget *obs_row = adw_action_row_new();
+    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(obs_row), "Modo observação");
+    adw_action_row_set_subtitle(ADW_ACTION_ROW(obs_row),
+                                "Só registra os ghosts, sem capturar o mouse");
+    adw_action_row_add_suffix(ADW_ACTION_ROW(obs_row), a->chk_observe);
+    adw_action_row_set_activatable_widget(ADW_ACTION_ROW(obs_row), a->chk_observe);
+    adw_preferences_group_add(ADW_PREFERENCES_GROUP(g_cfg), obs_row);
+    gtk_box_append(GTK_BOX(left), g_cfg);
 
-    gtk_grid_attach(GTK_GRID(cfg), make_label("Tempo de inatividade (ms):", NULL), 0, 2, 1, 1);
-    gtk_grid_attach(GTK_GRID(cfg), a->sp_idle, 1, 2, 1, 1);
-    gtk_grid_attach(GTK_GRID(cfg), make_desc(
-        "Depois desse tempo sem eventos, o próximo tick passa direto em qualquer "
-        "direção. Não use um valor menor que o tempo de confirmação."), 2, 2, 1, 1);
+    gtk_box_append(GTK_BOX(root), left);
 
-    a->chk_observe = gtk_check_button_new_with_label(
-        "Modo observação (o mouse não é capturado; só registra os ghosts)");
-    g_signal_connect(a->chk_observe, "toggled", G_CALLBACK(on_params_changed), a);
-    gtk_grid_attach(GTK_GRID(cfg), a->chk_observe, 0, 3, 3, 1);
+    /* ============ coluna direita: números, anel e log ============ */
+    GtkWidget *right = gtk_box_new(GTK_ORIENTATION_VERTICAL, 14);
+    gtk_widget_set_hexpand(right, TRUE);
 
-    gtk_box_append(GTK_BOX(root), make_frame("Configuração do filtro", cfg));
+    GtkWidget *tiles = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    gtk_box_set_homogeneous(GTK_BOX(tiles), TRUE);
+    static const char *caps[5] = { "Recebidos", "Liberados", "Filtrados",
+                                   "Taxa de ghost", "Tempo ativo" };
+    for (int i = 0; i < 5; i++) {
+        gtk_box_append(GTK_BOX(tiles), make_tile(a, i, caps[i]));
+    }
+    gtk_box_append(GTK_BOX(right), tiles);
 
-    /* --- controle --- */
-    GtkWidget *ctl = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    /* anel dos setores + legenda */
+    GtkWidget *ring_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 18);
+    gtk_widget_add_css_class(ring_row, "card");
+    gtk_widget_add_css_class(ring_row, "stat-tile");
 
-    a->status = make_label("● Filtro parado", NULL);
-    gtk_widget_set_hexpand(a->status, TRUE);
-    gtk_label_set_wrap(GTK_LABEL(a->status), TRUE);
+    a->sec_period = DEFAULT_PERIOD;
+    a->sec_draw = gtk_drawing_area_new();
+    gtk_drawing_area_set_content_width(GTK_DRAWING_AREA(a->sec_draw), 150);
+    gtk_drawing_area_set_content_height(GTK_DRAWING_AREA(a->sec_draw), 150);
+    gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(a->sec_draw), draw_sectors,
+                                   a, NULL);
+    gtk_widget_add_tick_callback(a->sec_draw, pulse_tick, a, NULL);
 
-    a->btn_start = gtk_button_new_with_label("Iniciar filtro");
-    gtk_widget_add_css_class(a->btn_start, "suggested-action");
-    gtk_widget_set_sensitive(a->btn_start, FALSE);
-    g_signal_connect(a->btn_start, "clicked", G_CALLBACK(on_start_clicked), a);
+    a->ring_lbl = make_label("0.0%", "ring-pct");
+    gtk_widget_set_halign(a->ring_lbl, GTK_ALIGN_CENTER);
+    gtk_widget_set_valign(a->ring_lbl, GTK_ALIGN_CENTER);
+    GtkWidget *ov = gtk_overlay_new();
+    gtk_overlay_set_child(GTK_OVERLAY(ov), a->sec_draw);
+    gtk_overlay_add_overlay(GTK_OVERLAY(ov), a->ring_lbl);
+    gtk_box_append(GTK_BOX(ring_row), ov);
 
-    gtk_box_append(GTK_BOX(ctl), a->status);
-    gtk_box_append(GTK_BOX(ctl), a->btn_start);
-    gtk_box_append(GTK_BOX(root), ctl);
+    GtkWidget *rinfo = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    gtk_widget_set_valign(rinfo, GTK_ALIGN_CENTER);
+    GtkWidget *rt = make_label("Leito da roda", "heading");
+    a->sec_label = make_label("", "dim-label");
+    GtkWidget *legend = make_label(
+        "Cada fatia é um detente. Quanto mais vermelha, mais ghosts o filtro "
+        "viu ali; a fatia em destaque é a posição atual.", "dim-label");
+    gtk_widget_add_css_class(legend, "caption");
+    gtk_label_set_wrap(GTK_LABEL(legend), TRUE);
+    gtk_box_append(GTK_BOX(rinfo), rt);
+    gtk_box_append(GTK_BOX(rinfo), a->sec_label);
+    gtk_box_append(GTK_BOX(rinfo), legend);
+    gtk_widget_set_hexpand(rinfo, TRUE);
+    gtk_box_append(GTK_BOX(ring_row), rinfo);
+    gtk_box_append(GTK_BOX(right), ring_row);
 
-    /* --- monitor --- */
-    GtkWidget *mon = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
-
-    a->lbl_stats1 = make_label("", NULL);
-    a->lbl_stats2 = make_label("", NULL);
-    gtk_box_append(GTK_BOX(mon), a->lbl_stats1);
-    gtk_box_append(GTK_BOX(mon), a->lbl_stats2);
+    /* monitor */
+    GtkWidget *mhead = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    GtkWidget *mt = make_label("Monitor da roda", "heading");
+    gtk_widget_set_hexpand(mt, TRUE);
+    a->chk_ghosts = gtk_check_button_new_with_label("Só ghosts");
+    GtkWidget *btn_clear = gtk_button_new_from_icon_name("edit-clear-all-symbolic");
+    GtkWidget *btn_save = gtk_button_new_from_icon_name("document-save-symbolic");
+    gtk_widget_set_tooltip_text(btn_clear, "Limpar");
+    gtk_widget_set_tooltip_text(btn_save, "Salvar log…");
+    gtk_widget_add_css_class(btn_clear, "flat");
+    gtk_widget_add_css_class(btn_save, "flat");
+    g_signal_connect(btn_clear, "clicked", G_CALLBACK(on_clear_clicked), a);
+    g_signal_connect(btn_save, "clicked", G_CALLBACK(on_save_clicked), a);
+    gtk_box_append(GTK_BOX(mhead), mt);
+    gtk_box_append(GTK_BOX(mhead), a->chk_ghosts);
+    gtk_box_append(GTK_BOX(mhead), btn_clear);
+    gtk_box_append(GTK_BOX(mhead), btn_save);
+    gtk_box_append(GTK_BOX(right), mhead);
 
     a->monitor = gtk_text_view_new();
     gtk_text_view_set_editable(GTK_TEXT_VIEW(a->monitor), FALSE);
     gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(a->monitor), FALSE);
     gtk_text_view_set_monospace(GTK_TEXT_VIEW(a->monitor), TRUE);
+    gtk_text_view_set_left_margin(GTK_TEXT_VIEW(a->monitor), 10);
+    gtk_text_view_set_top_margin(GTK_TEXT_VIEW(a->monitor), 6);
     a->buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(a->monitor));
 
     GtkTextIter it;
@@ -1085,25 +1457,13 @@ static void build_ui(App *a)
 
     GtkWidget *scroll = gtk_scrolled_window_new();
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll), a->monitor);
-    gtk_scrolled_window_set_min_content_height(GTK_SCROLLED_WINDOW(scroll), 220);
+    gtk_scrolled_window_set_min_content_height(GTK_SCROLLED_WINDOW(scroll), 100);
     gtk_widget_set_vexpand(scroll, TRUE);
-    gtk_box_append(GTK_BOX(mon), scroll);
+    gtk_widget_add_css_class(scroll, "card");
+    gtk_widget_add_css_class(scroll, "log-card");
+    gtk_box_append(GTK_BOX(right), scroll);
 
-    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
-    a->chk_ghosts = gtk_check_button_new_with_label("Mostrar só possíveis ghosts");
-    gtk_widget_set_hexpand(a->chk_ghosts, TRUE);
-    GtkWidget *btn_clear = gtk_button_new_with_label("Limpar");
-    GtkWidget *btn_save = gtk_button_new_with_label("Salvar log…");
-    g_signal_connect(btn_clear, "clicked", G_CALLBACK(on_clear_clicked), a);
-    g_signal_connect(btn_save, "clicked", G_CALLBACK(on_save_clicked), a);
-    gtk_box_append(GTK_BOX(row), a->chk_ghosts);
-    gtk_box_append(GTK_BOX(row), btn_clear);
-    gtk_box_append(GTK_BOX(row), btn_save);
-    gtk_box_append(GTK_BOX(mon), row);
-
-    GtkWidget *mon_frame = make_frame("Monitor da roda", mon);
-    gtk_widget_set_vexpand(mon_frame, TRUE);
-    gtk_box_append(GTK_BOX(root), mon_frame);
+    gtk_box_append(GTK_BOX(root), right);
 
     update_stats(a);
 }
@@ -1134,10 +1494,25 @@ static void on_activate(GtkApplication *app, gpointer data)
     cfg_load(a);
     build_ui(a);
     rebuild_devices(a, TRUE);
+    g_timeout_add_seconds(3, auto_refresh_cb, a);
     check_service(a);
     update_buttons(a);
+    g_application_hold(G_APPLICATION(a->gapp));
 
-    g_timeout_add_seconds(3, auto_refresh_cb, a);
+    tray_cbs_t cbs = {
+        .show_window = tray_on_show,
+        .quit = tray_on_quit,
+        .select_device = tray_on_device,
+        .set_confirm = tray_on_confirm,
+        .set_flush = tray_on_flush,
+        .set_idle = tray_on_idle,
+        .toggle_filter = tray_on_toggle,
+        .user = a,
+    };
+    a->tray = tray_start(&cbs);
+    tray_sync(a);
+
+    g_timeout_add_seconds(2, G_SOURCE_FUNC(NULL), NULL);
     gtk_window_present(GTK_WINDOW(a->win));
 }
 

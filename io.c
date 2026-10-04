@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -58,7 +59,106 @@ typedef struct {
     size_t ctl_len;
     int stop;
     char last_state[16];
+
+    char state_path[512];       /* "" = sem persistência */
+    double last_save;
 } sess_t;
+
+/* ------------------------------------------------------------------ */
+/* estado aprendido (persistência)                                     */
+/* ------------------------------------------------------------------ */
+
+#define SAVE_EVERY_S 60.0
+
+static void mkdir_p(char *path)
+{
+    for (char *p = path + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            mkdir(path, 0755);
+            *p = '/';
+        }
+    }
+    mkdir(path, 0755);
+}
+
+/* Um arquivo por mouse: <dir>/<nome>.state */
+static void state_init(sess_t *s, const char *devname)
+{
+    char dir[300];
+    const char *env;
+
+    s->state_path[0] = '\0';
+
+    if (s->cfg->state_dir) {
+        snprintf(dir, sizeof(dir), "%s", s->cfg->state_dir);
+    } else if (geteuid() == 0) {
+        snprintf(dir, sizeof(dir), "/var/lib/wheel-filter");
+    } else if ((env = getenv("XDG_STATE_HOME")) && *env) {
+        snprintf(dir, sizeof(dir), "%s/wheel-filter", env);
+    } else if ((env = getenv("HOME")) && *env) {
+        snprintf(dir, sizeof(dir), "%s/.local/state/wheel-filter", env);
+    } else {
+        return;
+    }
+
+    char key[128];
+    size_t k = 0;
+
+    for (const char *c = devname; *c && k + 1 < sizeof(key); c++) {
+        key[k++] = (*c == '/' || *c == ' ') ? '_' : *c;
+    }
+    key[k] = '\0';
+
+    mkdir_p(dir);
+    snprintf(s->state_path, sizeof(s->state_path), "%s/%s.state", dir, key);
+}
+
+static void state_load(sess_t *s)
+{
+    if (!s->state_path[0]) {
+        return;
+    }
+
+    FILE *fp = fopen(s->state_path, "r");
+
+    if (fp) {
+        filter_load(&s->f, fp);
+        fclose(fp);
+    }
+    s->last_save = now_realtime();
+}
+
+static void state_save(sess_t *s)
+{
+    if (!s->state_path[0]) {
+        return;
+    }
+
+    char tmp[sizeof(s->state_path) + 8];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", s->state_path);
+
+    FILE *fp = fopen(tmp, "w");
+
+    if (!fp) {
+        return;
+    }
+    filter_save(&s->f, fp);
+
+    if (fclose(fp) == 0) {
+        rename(tmp, s->state_path);
+    } else {
+        unlink(tmp);
+    }
+    s->last_save = now_realtime();
+}
+
+static void state_maybe_save(sess_t *s)
+{
+    if (s->state_path[0] && now_realtime() - s->last_save > SAVE_EVERY_S) {
+        state_save(s);
+    }
+}
 
 /* ------------------------------------------------------------------ */
 /* estado e comandos                                                   */
@@ -374,6 +474,10 @@ static int serve(sess_t *s, int in, const char *resolved)
     }
 
     filter_reset(&s->f);
+    if (!cfg->observe) {
+        state_init(s, devname);
+        state_load(s);
+    }
     s->ring_n = 0;
     s->have_prev = 0;
 
@@ -412,6 +516,7 @@ static int serve(sess_t *s, int in, const char *resolved)
 
         if (r == 0) {
             filter_expire(&s->f, now_realtime());
+            state_maybe_save(s);
             continue;
         }
 
@@ -470,6 +575,7 @@ static int serve(sess_t *s, int in, const char *resolved)
             s->ring_n++;
 
             filter_feed(&s->f, &t);
+            state_maybe_save(s);
         }
 
         if (nother > 0) {
@@ -486,6 +592,7 @@ static int serve(sess_t *s, int in, const char *resolved)
     }
 
     if (!cfg->observe) {
+        state_save(s);
         ioctl(in, EVIOCGRAB, 0);
         ioctl(s->out, UI_DEV_DESTROY);
         close(s->out);

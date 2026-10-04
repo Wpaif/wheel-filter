@@ -22,6 +22,7 @@ typedef struct {
     double idle_ms;
     int observe;        /* 1: só observa, não captura nem filtra */
     int ctl_fd;         /* -1, ou fd com comandos "STOP" e "SET c f i" */
+    const char *state_dir; /* onde guardar o que o filtro aprendeu (NULL = padrão) */
     FILE *logf;         /* NULL ou arquivo com os ticks descartados */
     tick_cb on_tick;    /* pode ser NULL */
     state_cb on_state;  /* pode ser NULL */
